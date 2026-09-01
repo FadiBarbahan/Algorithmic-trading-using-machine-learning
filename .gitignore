@@ -1,0 +1,10 @@
+test.py
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+data_cache/
+
+results/

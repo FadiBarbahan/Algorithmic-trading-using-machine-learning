@@ -7,10 +7,16 @@ in the code.
 """
 
 DEFAULT_CONFIG = {
+    # ---- Storage ----
+    "storage": {
+        "cache_dir": "data_cache",   # raw OHLCV parquet files, written by setup_data.py
+        "results_dir": "results",    # fold results, equity curves, plots, tearsheets
+    },
+
     # ---- Universe / data ----
     "tickers": ["AAPL", "MSFT", "AMZN", "GOOGL", "META", "JPM", "XOM", "JNJ"],
     "benchmark": "SPY",
-    "start_date": None,   # None = max available history from yfinance
+    "start_date": "2012-05-18",   # 2012-05-18: with META, 2004-08-19: without META, 1997-05-15: without GOOGL
     "end_date": None,     # None = today
 
     # ---- Prediction horizon ----

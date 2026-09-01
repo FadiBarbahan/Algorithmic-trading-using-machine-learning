@@ -1,69 +1,154 @@
 """
-Simple vectorized backtest: convert predicted labels into positions, apply
-transaction costs, compute the resulting equity curve and summary stats.
+Barrier-mirrored, long-only backtest.
 
-This is intentionally simple (no slippage model beyond a flat bps cost, no
-position sizing beyond +-1/0). It exists to test the success criterion:
-"profitable after ~5bps transaction costs", not to be a production backtester.
+Execution rule (mirrors the label-generation logic exactly, using the same
+`scan_forward_barrier` primitive from labeling.py):
+- Enter long only when the model predicts "up" (1) AND we're not already
+  holding a position in that ticker.
+- Once in a trade, ignore all subsequent signals (down/flat/up) until the
+  trade exits via whichever comes first: upper barrier (take-profit), lower
+  barrier (stop-loss), or the vertical/time barrier -- using the SAME
+  k_upper/k_lower/horizon as label generation.
+- This makes trades non-overlapping *by construction* (we never enter a new
+  trade while one is open), so a plain cumulative product across trades is
+  valid -- no double-counting of overlapping windows.
+
+Because this is a state machine (must know "am I in a trade right now"),
+it's run per-ticker sequentially, then combined into an equal-weighted
+portfolio return series across the fixed universe.
+
+Financial metrics are computed with quantstats rather than hand-rolled.
 """
 
 import numpy as np
 import pandas as pd
+import quantstats as qs
+
+from labeling import scan_forward_barrier
 
 
-def positions_from_predictions(predictions: pd.Series, cfg: dict) -> pd.Series:
-    mapping = {
-        1: cfg["position_on_up_signal"],
-        0: cfg["position_on_flat_signal"],
-        -1: cfg["position_on_down_signal"],
-    }
-    return predictions.map(mapping)
-
-
-def run_backtest(
-    predictions: pd.Series,
-    forward_returns: pd.Series,
-    cfg: dict,
-) -> dict:
-    """Run a simple long/flat/short backtest.
+def simulate_ticker_strategy(
+    dates: pd.DatetimeIndex,
+    log_returns: np.ndarray,
+    rolling_vol: np.ndarray,
+    predictions: np.ndarray,
+    horizon: int,
+    k_upper: float,
+    k_lower: float,
+    cost_bps: float,
+):
+    """Run the barrier-mirrored long-only strategy for a single ticker.
 
     Args:
-        predictions: predicted label per period {-1, 0, 1}, indexed by date
-        forward_returns: actual realized return over the same horizon used
-            for the label (i.e. the return the position would have earned)
-        cfg: the `backtest` sub-dict from config.DEFAULT_CONFIG
+        dates: DatetimeIndex, one per row, sorted ascending
+        log_returns: array of per-period log returns, same length as dates
+        rolling_vol: array of rolling vol known at each t (same basis as labeling)
+        predictions: array of predicted labels {-1, 0, 1}, same length as dates
+        horizon, k_upper, k_lower: must match label generation exactly
+        cost_bps: round-trip-per-side transaction cost in bps
 
     Returns:
-        dict with equity curve, per-period net returns, and summary stats
+        daily_returns: pd.Series indexed by `dates`, net-of-cost returns,
+            zero on days with no open/closing trade, the realized trade
+            return lumped on the exit day otherwise
+        trades_df: pd.DataFrame, one row per completed trade
     """
-    positions = positions_from_predictions(predictions, cfg)
-    positions = positions.reindex(forward_returns.index).fillna(0)
+    n = len(dates)
+    daily_returns = np.zeros(n)
+    cost = cost_bps / 10_000
+    trades = []
 
-    gross_returns = positions * forward_returns
+    t = 0
+    while t < n:
+        if predictions[t] == 1:
+            result = scan_forward_barrier(
+                log_returns, t, rolling_vol[t], horizon, k_upper, k_lower
+            )
+            if result is None:
+                t += 1
+                continue
 
-    # Transaction cost charged whenever position changes (enter/exit/flip)
-    position_changes = positions.diff().abs().fillna(positions.abs())
-    cost_per_change = cfg["transaction_cost_bps"] / 10_000
-    costs = position_changes * cost_per_change
+            exit_offset, cum_log_return, hit_type = result
+            exit_idx = t + exit_offset
 
-    net_returns = gross_returns - costs
-    equity_curve = (1 + net_returns).cumprod()
+            gross_return = np.exp(cum_log_return) - 1
+            net_return = gross_return - 2 * cost  # cost charged on entry + exit
 
-    total_return = equity_curve.iloc[-1] - 1 if len(equity_curve) else np.nan
-    ann_factor = 252
-    sharpe = (
-        net_returns.mean() / net_returns.std() * np.sqrt(ann_factor)
-        if net_returns.std() > 0
-        else np.nan
-    )
-    win_rate = (net_returns > 0).mean() if len(net_returns) else np.nan
+            daily_returns[exit_idx] += net_return
+            trades.append({
+                "entry_date": dates[t],
+                "exit_date": dates[exit_idx],
+                "holding_days": exit_offset,
+                "exit_reason": hit_type,
+                "gross_return": gross_return,
+                "net_return": net_return,
+            })
 
+            t = exit_idx + 1  # no new entries until this trade is closed
+        else:
+            t += 1
+
+    daily_returns_series = pd.Series(daily_returns, index=dates, name="return")
+    trades_df = pd.DataFrame(trades)
+    return daily_returns_series, trades_df
+
+
+def combine_portfolio(per_ticker_returns: dict, universe_size: int) -> pd.Series:
+    """Equal-weight the fixed universe: each ticker gets 1/universe_size of
+    capital regardless of whether it's currently in a trade. Days with no
+    trade for a given ticker contribute 0 for that ticker's slice.
+    """
+    if not per_ticker_returns:
+        return pd.Series(dtype=float)
+
+    combined = pd.concat(per_ticker_returns.values(), axis=1).fillna(0)
+    portfolio_returns = combined.sum(axis=1) / universe_size
+    portfolio_returns.name = "portfolio_return"
+    return portfolio_returns.sort_index()
+
+
+def compute_financial_metrics(returns: pd.Series) -> dict:
+    """Financial performance metrics via quantstats. Returns NaN for any
+    metric that errors out (e.g. too few nonzero returns to compute Sortino).
+    """
+    metrics = {}
+    metric_fns = {
+        "total_return": lambda r: qs.stats.comp(r),
+        "cagr": qs.stats.cagr,
+        "sharpe": qs.stats.sharpe,
+        "sortino": qs.stats.sortino,
+        "max_drawdown": qs.stats.max_drawdown,
+        "calmar": qs.stats.calmar,
+        "win_rate": qs.stats.win_rate,
+        "profit_factor": qs.stats.profit_factor,
+        "volatility": qs.stats.volatility,
+    }
+    for name, fn in metric_fns.items():
+        try:
+            metrics[name] = float(fn(returns))
+        except Exception:
+            metrics[name] = np.nan
+    return metrics
+
+
+def compute_trade_stats(trades_df: pd.DataFrame) -> dict:
+    """Descriptive stats on the actual trades taken -- plain pandas, no
+    library needed for this since it's just aggregating our own trade log.
+    """
+    if trades_df.empty:
+        return {
+            "n_trades": 0, "win_rate": np.nan, "avg_net_return": np.nan,
+            "avg_holding_days": np.nan, "pct_exit_upper": np.nan,
+            "pct_exit_lower": np.nan, "pct_exit_vertical": np.nan,
+        }
+
+    exit_counts = trades_df["exit_reason"].value_counts(normalize=True)
     return {
-        "equity_curve": equity_curve,
-        "net_returns": net_returns,
-        "total_return": total_return,
-        "sharpe": sharpe,
-        "win_rate": win_rate,
-        "n_periods": len(net_returns),
-        "n_trades": int((position_changes > 0).sum()),
+        "n_trades": len(trades_df),
+        "win_rate": (trades_df["net_return"] > 0).mean(),
+        "avg_net_return": trades_df["net_return"].mean(),
+        "avg_holding_days": trades_df["holding_days"].mean(),
+        "pct_exit_upper": exit_counts.get("upper", 0.0),
+        "pct_exit_lower": exit_counts.get("lower", 0.0),
+        "pct_exit_vertical": exit_counts.get("vertical", 0.0),
     }
