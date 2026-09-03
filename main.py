@@ -1,7 +1,8 @@
 """
 Main pipeline (repeatable): load cached data -> features -> triple-barrier
 labels -> walk-forward CV -> baseline model -> classification metrics ->
-barrier-mirrored long-only backtest -> save results + plots.
+barrier-mirrored long-only backtest -> permutation-test significance check ->
+buy-and-hold benchmark comparison -> save results + plots.
 
 Requires `python setup_data.py` to have been run first (this script does not
 touch the network).
@@ -24,18 +25,18 @@ from labeling import triple_barrier_labels
 from cv import walk_forward_splits
 from models import build_model, fit_predict
 from backtest import (
-    simulate_ticker_strategy,
-    combine_portfolio,
+    run_fold_backtest,
     compute_financial_metrics,
     compute_trade_stats,
 )
+from permutation_test import run_permutation_test
 
 FEATURE_COLUMNS_EXCLUDE = {
     "_log_return", "_rolling_vol_for_labeling", "label", "ticker", "date", "forward_return",
 }
 
 
-def build_pooled_dataset(cfg: dict) -> pd.DataFrame:
+def build_pooled_dataset(cfg: dict):
     """Load cached data, compute features/labels per ticker, and pool them.
 
     Fix applied here: the pooled panel is trimmed to start only after every
@@ -44,6 +45,13 @@ def build_pooled_dataset(cfg: dict) -> pd.DataFrame:
     meaningful for a cross-sectional model, and it was also causing early
     walk-forward folds to land entirely inside the pre-universe "warmup
     desert" and come back empty.
+
+    Returns:
+        pooled: the trimmed, labeled, pooled feature DataFrame
+        data: dict[ticker -> raw OHLCV DataFrame] (needed later for the
+            equal-weight buy-and-hold benchmark)
+        benchmark_df: raw OHLCV DataFrame for the benchmark (e.g. SPY),
+            needed later for the SPY buy-and-hold benchmark
     """
     data, benchmark_df = load_cached_universe(
         cfg["tickers"], cfg["benchmark"], cfg["storage"]["cache_dir"]
@@ -79,7 +87,7 @@ def build_pooled_dataset(cfg: dict) -> pd.DataFrame:
     pooled = pooled[pooled["date"] >= common_start]
     pooled = pooled.dropna(subset=["label"])
     pooled = pooled.sort_values("date").reset_index(drop=True)
-    return pooled
+    return pooled, data, benchmark_df
 
 
 def evaluate_baseline(y_true: pd.Series) -> float:
@@ -89,44 +97,24 @@ def evaluate_baseline(y_true: pd.Series) -> float:
     return (y_true == 1).mean()
 
 
-def run_fold_backtest(test_df: pd.DataFrame, preds: pd.Series, cfg: dict):
-    """Run the barrier-mirrored backtest for every ticker in this fold's
-    test set, then combine into an equal-weighted portfolio return series.
+def build_buy_and_hold_benchmarks(data: dict, benchmark_df: pd.DataFrame, target_index: pd.DatetimeIndex):
+    """Build two buy-and-hold benchmark return series, aligned to the
+    strategy's out-of-sample date index so quantstats can compare them
+    apples-to-apples:
+      - SPY buy-and-hold (matches config["benchmark"])
+      - equal-weight buy-and-hold across the 8-ticker universe (apples-to-
+        apples with the strategy's own universe and weighting convention)
     """
-    label_cfg = cfg["label"]
-    horizon = cfg["horizon"]
-    cost_bps = cfg["backtest"]["transaction_cost_bps"]
-    universe_size = len(cfg["tickers"])
+    spy_returns = benchmark_df["close"].pct_change()
+    spy_aligned = spy_returns.reindex(target_index).fillna(0)
+    spy_aligned.name = "SPY buy-and-hold"
 
-    per_ticker_returns = {}
-    all_trades = []
+    ticker_returns = {t: df["close"].pct_change() for t, df in data.items()}
+    universe_bh = pd.concat(ticker_returns.values(), axis=1).mean(axis=1)
+    universe_bh_aligned = universe_bh.reindex(target_index).fillna(0)
+    universe_bh_aligned.name = "Equal-weight universe buy-and-hold"
 
-    for ticker, group in test_df.groupby("ticker"):
-        group = group.sort_values("date")
-        dates = pd.DatetimeIndex(group["date"])
-        log_returns = group["_log_return"].values
-        rolling_vol = group["_rolling_vol_for_labeling"].values
-        ticker_preds = preds.loc[group.index].values
-
-        daily_returns, trades_df = simulate_ticker_strategy(
-            dates=dates,
-            log_returns=log_returns,
-            rolling_vol=rolling_vol,
-            predictions=ticker_preds,
-            horizon=horizon,
-            k_upper=label_cfg["k_upper"],
-            k_lower=label_cfg["k_lower"],
-            cost_bps=cost_bps,
-        )
-        per_ticker_returns[ticker] = daily_returns
-        if not trades_df.empty:
-            trades_df["ticker"] = ticker
-            all_trades.append(trades_df)
-
-    portfolio_returns = combine_portfolio(per_ticker_returns, universe_size)
-    trades_df = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
-
-    return portfolio_returns, trades_df
+    return spy_aligned, universe_bh_aligned
 
 
 def plot_fold_timeline(fold_windows: list, results_dir: Path):
@@ -169,13 +157,38 @@ def plot_confusion_matrix(cm: np.ndarray, labels: list, fold_i: int, results_dir
     plt.close(fig)
 
 
+def plot_permutation_null(perm_result: dict, observed_precision: float, observed_sharpe: float,
+                           fold_i: int, results_dir: Path):
+    """Null-distribution histograms with the observed (real) value marked --
+    the fastest way to see visually whether a result looks like skill or luck.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+
+    axes[0].hist(perm_result["null_precision"], bins=30, color="steelblue", alpha=0.8)
+    axes[0].axvline(observed_precision, color="darkorange", linewidth=2, label="observed")
+    axes[0].set_title(f"Fold {fold_i}: null precision\n(p={perm_result['p_value_precision']:.3f})")
+    axes[0].set_xlabel("Up-class precision")
+    axes[0].legend()
+
+    finite_sharpe = perm_result["null_sharpe"][np.isfinite(perm_result["null_sharpe"])]
+    axes[1].hist(finite_sharpe, bins=30, color="steelblue", alpha=0.8)
+    axes[1].axvline(observed_sharpe, color="darkorange", linewidth=2, label="observed")
+    axes[1].set_title(f"Fold {fold_i}: null Sharpe\n(p={perm_result['p_value_sharpe']:.3f})")
+    axes[1].set_xlabel("Backtest Sharpe")
+    axes[1].legend()
+
+    fig.tight_layout()
+    fig.savefig(results_dir / f"permutation_test_fold{fold_i}.png", dpi=120)
+    plt.close(fig)
+
+
 def run_pipeline(cfg: dict = None):
     cfg = cfg or DEFAULT_CONFIG
     results_dir = Path(cfg["storage"]["results_dir"])
     results_dir.mkdir(parents=True, exist_ok=True)
 
     print("Loading cached data and building pooled feature/label set...")
-    pooled = build_pooled_dataset(cfg)
+    pooled, data, benchmark_df = build_pooled_dataset(cfg)
     print(f"Pooled dataset: {len(pooled)} rows across {pooled['ticker'].nunique()} tickers, "
           f"{pooled['date'].min().date()} to {pooled['date'].max().date()}")
 
@@ -183,11 +196,13 @@ def run_pipeline(cfg: dict = None):
 
     unique_dates = np.sort(pooled["date"].unique())
     cv_cfg = cfg["cv"]
+    pt_cfg = cfg["permutation_test"]
 
     fold_summaries = []
     fold_windows = []
     all_portfolio_returns = []
     all_trades = []
+    all_permutation_nulls = []
 
     class_labels = [-1, 0, 1]
     class_names = ["down", "flat", "up"]
@@ -247,6 +262,25 @@ def run_pipeline(cfg: dict = None):
               f"max_dd={fin_metrics['max_drawdown']:.4f}, n_trades={trade_stats['n_trades']}, "
               f"trade_win_rate={trade_stats['win_rate']}")
 
+        # --- Permutation test: is this result distinguishable from noise? ---
+        perm_result = None
+        if pt_cfg["enabled"]:
+            perm_result = run_permutation_test(
+                X_train, y_train, X_test, y_test, test_df,
+                observed_precision=up_precision,
+                observed_sharpe=fin_metrics["sharpe"],
+                observed_total_return=fin_metrics["total_return"],
+                cfg=cfg,
+                fold_i=fold_i,
+            )
+            plot_permutation_null(perm_result, up_precision, fin_metrics["sharpe"], fold_i, results_dir)
+            all_permutation_nulls.append({
+                "fold": fold_i,
+                "null_precision": perm_result["null_precision"],
+                "null_sharpe": perm_result["null_sharpe"],
+                "null_total_return": perm_result["null_total_return"],
+            })
+
         fold_summaries.append({
             "fold": fold_i,
             "up_precision": up_precision,
@@ -256,6 +290,11 @@ def run_pipeline(cfg: dict = None):
             "beats_baseline": beat_baseline,
             **{f"bt_{k}": v for k, v in fin_metrics.items()},
             **{f"trade_{k}": v for k, v in trade_stats.items()},
+            **({
+                "perm_p_value_precision": perm_result["p_value_precision"],
+                "perm_p_value_sharpe": perm_result["p_value_sharpe"],
+                "perm_p_value_total_return": perm_result["p_value_total_return"],
+            } if perm_result else {}),
         })
         all_portfolio_returns.append(portfolio_returns)
         if not trades_df.empty:
@@ -272,6 +311,19 @@ def run_pipeline(cfg: dict = None):
 
     print(f"\nSuccess criterion (beats baseline on ALL folds): {all_folds_beat_baseline}")
     print(f"Success criterion (overall backtest profitable after costs): {overall_profitable}")
+    if pt_cfg["enabled"] and len(results_df):
+        print(f"Permutation p-values by fold (precision): {results_df['perm_p_value_precision'].round(3).tolist()}")
+        print(f"Permutation p-values by fold (sharpe):    {results_df['perm_p_value_sharpe'].round(3).tolist()}")
+
+    # --- Buy-and-hold benchmarks, aligned to the same out-of-sample dates ---
+    spy_bh, universe_bh = build_buy_and_hold_benchmarks(data, benchmark_df, combined_returns.index)
+    spy_metrics = compute_financial_metrics(spy_bh)
+    universe_bh_metrics = compute_financial_metrics(universe_bh)
+    print("\n=== Buy-and-hold benchmarks (same out-of-sample period) ===")
+    print(f"SPY buy-and-hold:            total_return={spy_metrics['total_return']:.4f}, "
+          f"sharpe={spy_metrics['sharpe']:.2f}, max_dd={spy_metrics['max_drawdown']:.4f}")
+    print(f"Equal-weight universe hold:  total_return={universe_bh_metrics['total_return']:.4f}, "
+          f"sharpe={universe_bh_metrics['sharpe']:.2f}, max_dd={universe_bh_metrics['max_drawdown']:.4f}")
 
     # --- Save results to disk ---
     results_df.to_parquet(results_dir / "fold_results.parquet")
@@ -279,16 +331,33 @@ def run_pipeline(cfg: dict = None):
     combined_returns.to_frame().to_parquet(results_dir / "combined_portfolio_returns.parquet")
     if all_trades:
         pd.concat(all_trades, ignore_index=True).to_parquet(results_dir / "all_trades.parquet")
+    if all_permutation_nulls:
+        # store as one row per fold with the null arrays as list columns
+        pd.DataFrame(all_permutation_nulls).to_parquet(results_dir / "permutation_nulls.parquet")
+
+    benchmark_comparison = pd.DataFrame({
+        "strategy": compute_financial_metrics(combined_returns),
+        "spy_buy_and_hold": spy_metrics,
+        "equal_weight_universe_buy_and_hold": universe_bh_metrics,
+    })
+    benchmark_comparison.to_csv(results_dir / "benchmark_comparison.csv")
 
     plot_fold_timeline(fold_windows, results_dir)
 
     if len(combined_returns) > 0 and combined_returns.abs().sum() > 0:
         try:
             qs.reports.html(
-                combined_returns, output=str(results_dir / "tearsheet.html"),
-                title="Walk-forward out-of-sample backtest",
+                combined_returns, benchmark=spy_bh,
+                output=str(results_dir / "tearsheet_vs_spy.html"),
+                title="Strategy vs SPY buy-and-hold",
             )
-            print(f"\nSaved quantstats tearsheet to {results_dir / 'tearsheet.html'}")
+            qs.reports.html(
+                combined_returns, benchmark=universe_bh,
+                output=str(results_dir / "tearsheet_vs_universe_bh.html"),
+                title="Strategy vs equal-weight universe buy-and-hold",
+            )
+            print(f"\nSaved tearsheets to {results_dir / 'tearsheet_vs_spy.html'} and "
+                  f"{results_dir / 'tearsheet_vs_universe_bh.html'}")
         except Exception as e:
             print(f"[warn] quantstats tearsheet generation failed: {e}")
 

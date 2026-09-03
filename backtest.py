@@ -152,3 +152,47 @@ def compute_trade_stats(trades_df: pd.DataFrame) -> dict:
         "pct_exit_lower": exit_counts.get("lower", 0.0),
         "pct_exit_vertical": exit_counts.get("vertical", 0.0),
     }
+
+
+def run_fold_backtest(test_df: pd.DataFrame, preds: pd.Series, cfg: dict):
+    """Run the barrier-mirrored backtest for every ticker in this fold's
+    test set, then combine into an equal-weighted portfolio return series.
+
+    Lives here (not main.py) so both main.py and permutation_test.py can
+    call it without a circular import -- the permutation test needs to run
+    this exact same backtest logic on noise-trained predictions.
+    """
+    label_cfg = cfg["label"]
+    horizon = cfg["horizon"]
+    cost_bps = cfg["backtest"]["transaction_cost_bps"]
+    universe_size = len(cfg["tickers"])
+
+    per_ticker_returns = {}
+    all_trades = []
+
+    for ticker, group in test_df.groupby("ticker"):
+        group = group.sort_values("date")
+        dates = pd.DatetimeIndex(group["date"])
+        log_returns = group["_log_return"].values
+        rolling_vol = group["_rolling_vol_for_labeling"].values
+        ticker_preds = preds.loc[group.index].values
+
+        daily_returns, trades_df = simulate_ticker_strategy(
+            dates=dates,
+            log_returns=log_returns,
+            rolling_vol=rolling_vol,
+            predictions=ticker_preds,
+            horizon=horizon,
+            k_upper=label_cfg["k_upper"],
+            k_lower=label_cfg["k_lower"],
+            cost_bps=cost_bps,
+        )
+        per_ticker_returns[ticker] = daily_returns
+        if not trades_df.empty:
+            trades_df["ticker"] = ticker
+            all_trades.append(trades_df)
+
+    portfolio_returns = combine_portfolio(per_ticker_returns, universe_size)
+    trades_df = pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame()
+
+    return portfolio_returns, trades_df

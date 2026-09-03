@@ -76,8 +76,15 @@ DEFAULT_CONFIG = {
     # ---- Backtest ----
     "backtest": {
         "transaction_cost_bps": 5,   # 5 bps per side, as agreed success criterion
-        "position_on_up_signal": 1,   # long when model predicts up
-        "position_on_down_signal": -1,  # short when model predicts down (set 0 to disable shorting)
-        "position_on_flat_signal": 0,
+        # Long-only by construction (barrier-mirrored execution rule): enter
+        # only on "up" predictions, hold until upper/lower/vertical barrier.
+        # No short-side config needed -- see backtest.py's execution rule.
+    },
+
+    # ---- Permutation test (statistical significance check) ----
+    "permutation_test": {
+        "enabled": True,
+        "n_permutations": 200,   # label-shuffle refits per fold; logistic regression is cheap
+        "random_state": 42,
     },
 }
