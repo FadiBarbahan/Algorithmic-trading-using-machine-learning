@@ -182,6 +182,31 @@ def plot_permutation_null(perm_result: dict, observed_precision: float, observed
     plt.close(fig)
 
 
+def plot_pooled_permutation_null(pooled_result: dict, results_dir: Path):
+    """Null-distribution histograms for the POOLED (all-folds-stitched)
+    significance test -- the higher-power counterpart to the per-fold plots.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+
+    finite_sharpe = pooled_result["pooled_null_sharpe"][np.isfinite(pooled_result["pooled_null_sharpe"])]
+    axes[0].hist(finite_sharpe, bins=30, color="steelblue", alpha=0.8)
+    axes[0].axvline(pooled_result["observed_sharpe"], color="darkorange", linewidth=2, label="observed")
+    axes[0].set_title(f"Pooled null Sharpe (all folds stitched)\n(p={pooled_result['p_value_pooled_sharpe']:.3f})")
+    axes[0].set_xlabel("Overall out-of-sample Sharpe")
+    axes[0].legend()
+
+    finite_tr = pooled_result["pooled_null_total_return"][np.isfinite(pooled_result["pooled_null_total_return"])]
+    axes[1].hist(finite_tr, bins=30, color="steelblue", alpha=0.8)
+    axes[1].axvline(pooled_result["observed_total_return"], color="darkorange", linewidth=2, label="observed")
+    axes[1].set_title(f"Pooled null total return (all folds stitched)\n(p={pooled_result['p_value_pooled_total_return']:.3f})")
+    axes[1].set_xlabel("Overall out-of-sample total return")
+    axes[1].legend()
+
+    fig.tight_layout()
+    fig.savefig(results_dir / "permutation_test_pooled.png", dpi=120)
+    plt.close(fig)
+
+
 def run_pipeline(cfg: dict = None):
     cfg = cfg or DEFAULT_CONFIG
     results_dir = Path(cfg["storage"]["results_dir"])
@@ -203,6 +228,7 @@ def run_pipeline(cfg: dict = None):
     all_portfolio_returns = []
     all_trades = []
     all_permutation_nulls = []
+    fold_null_returns_by_fold = {}  # fold_i -> list of null return Series, for pooled testing
 
     class_labels = [-1, 0, 1]
     class_names = ["down", "flat", "up"]
@@ -280,6 +306,7 @@ def run_pipeline(cfg: dict = None):
                 "null_sharpe": perm_result["null_sharpe"],
                 "null_total_return": perm_result["null_total_return"],
             })
+            fold_null_returns_by_fold[fold_i] = perm_result["null_returns"]
 
         fold_summaries.append({
             "fold": fold_i,
@@ -314,6 +341,49 @@ def run_pipeline(cfg: dict = None):
     if pt_cfg["enabled"] and len(results_df):
         print(f"Permutation p-values by fold (precision): {results_df['perm_p_value_precision'].round(3).tolist()}")
         print(f"Permutation p-values by fold (sharpe):    {results_df['perm_p_value_sharpe'].round(3).tolist()}")
+
+    # --- Pooled significance test: stitch each permutation trial's noise-model
+    # results across ALL folds into one full out-of-sample null curve, and
+    # compare against the real stitched combined_returns. Far higher power
+    # than judging each fold's ~500-trade sample in isolation. ---
+    pooled_perm_result = None
+    if pt_cfg["enabled"] and fold_null_returns_by_fold:
+        n_permutations = pt_cfg["n_permutations"]
+        fold_order = sorted(fold_null_returns_by_fold.keys())
+        overall_metrics = compute_financial_metrics(combined_returns)
+
+        pooled_null_sharpe = np.empty(n_permutations)
+        pooled_null_total_return = np.empty(n_permutations)
+        for i in range(n_permutations):
+            stitched = pd.concat(
+                [fold_null_returns_by_fold[f][i] for f in fold_order]
+            ).sort_index()
+            m = compute_financial_metrics(stitched)
+            pooled_null_sharpe[i] = m["sharpe"] if not np.isnan(m["sharpe"]) else -np.inf
+            pooled_null_total_return[i] = m["total_return"] if not np.isnan(m["total_return"]) else -np.inf
+
+        p_pooled_sharpe = float(np.mean(pooled_null_sharpe >= overall_metrics["sharpe"]))
+        p_pooled_total_return = float(np.mean(pooled_null_total_return >= overall_metrics["total_return"]))
+
+        print(f"\n=== Pooled significance test (all {len(fold_order)} folds stitched, "
+              f"{n_permutations} permutations) ===")
+        print(f"Observed overall Sharpe: {overall_metrics['sharpe']:.3f} | pooled null p-value: {p_pooled_sharpe:.3f}")
+        print(f"Observed overall total return: {overall_metrics['total_return']:.3f} | "
+              f"pooled null p-value: {p_pooled_total_return:.3f}")
+
+        pooled_perm_result = {
+            "pooled_null_sharpe": pooled_null_sharpe,
+            "pooled_null_total_return": pooled_null_total_return,
+            "p_value_pooled_sharpe": p_pooled_sharpe,
+            "p_value_pooled_total_return": p_pooled_total_return,
+            "observed_sharpe": overall_metrics["sharpe"],
+            "observed_total_return": overall_metrics["total_return"],
+        }
+        plot_pooled_permutation_null(pooled_perm_result, results_dir)
+        pd.DataFrame({
+            "pooled_null_sharpe": pooled_null_sharpe,
+            "pooled_null_total_return": pooled_null_total_return,
+        }).to_parquet(results_dir / "permutation_pooled_nulls.parquet")
 
     # --- Buy-and-hold benchmarks, aligned to the same out-of-sample dates ---
     spy_bh, universe_bh = build_buy_and_hold_benchmarks(data, benchmark_df, combined_returns.index)

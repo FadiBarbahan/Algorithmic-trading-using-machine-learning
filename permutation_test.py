@@ -18,6 +18,12 @@ Cost note: N permutations means N model refits + N full backtests per fold.
 Logistic regression fits are cheap, so this stays fast for v1; switching to
 xgboost will make this substantially slower (worth revisiting n_permutations
 at that point).
+
+Each fold's full null return series (not just the summary metrics) is kept
+and returned, so main.py can additionally build a POOLED null distribution --
+stitching trial i's noise-model results across all folds into one full
+out-of-sample curve, for each of the n_permutations trials -- giving a much
+higher-power significance test than judging each fold in isolation.
 """
 
 import numpy as np
@@ -54,6 +60,7 @@ def run_permutation_test(
     null_precision = np.empty(n_permutations)
     null_sharpe = np.empty(n_permutations)
     null_total_return = np.empty(n_permutations)
+    null_returns = []  # full return series per permutation, for pooled/stitched significance testing across folds
 
     print(f"    Running {n_permutations} label-shuffle permutations for fold {fold_i}...")
     for i in range(n_permutations):
@@ -68,6 +75,7 @@ def run_permutation_test(
         )
 
         portfolio_returns, _ = run_fold_backtest(test_df, preds, cfg)
+        null_returns.append(portfolio_returns)
         fin_metrics = compute_financial_metrics(portfolio_returns)
         sharpe = fin_metrics["sharpe"]
         total_return = fin_metrics["total_return"]
@@ -91,6 +99,7 @@ def run_permutation_test(
         "null_precision": null_precision,
         "null_sharpe": null_sharpe,
         "null_total_return": null_total_return,
+        "null_returns": null_returns,
         "p_value_precision": p_precision,
         "p_value_sharpe": p_sharpe,
         "p_value_total_return": p_total_return,

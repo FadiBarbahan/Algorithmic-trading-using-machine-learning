@@ -63,9 +63,18 @@ or beat your real, unshuffled result.
   though it technically passed.
 
 This tests each fold in isolation and does **not** correct for checking 5
-folds at once — the deflated Sharpe ratio remains the right tool for that
-broader multiple-testing correction, and is still a good stretch goal before
-drawing strong conclusions across all folds combined.
+folds at once. A separate, higher-power **pooled test** addresses this: for
+each of the 200 permutation trials, the noise-model's results are stitched
+together across *all* folds into one full out-of-sample curve (trial 1's
+fold-0 result + trial 1's fold-1 result + ... ), giving 200 "full-history"
+null curves to compare your actual stitched combined-returns Sharpe/total
+return against. This uses far more data per null sample than any single
+fold's ~500-trade sample, so it's a meaningfully stronger test of whether
+the *overall* result is distinguishable from noise. Outputs:
+`permutation_test_pooled.png`, `permutation_pooled_nulls.parquet`. The
+deflated Sharpe ratio remains a good complementary stretch goal (it
+corrects analytically rather than by simulation, and separately accounts
+for the number of configurations you've tried).
 
 ## Benchmark comparisons
 

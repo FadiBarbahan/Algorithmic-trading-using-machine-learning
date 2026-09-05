@@ -14,9 +14,9 @@ DEFAULT_CONFIG = {
     },
 
     # ---- Universe / data ----
-    "tickers": ["AAPL", "MSFT", "AMZN", "GOOGL", "META", "JPM", "XOM", "JNJ"],
+    "tickers": ["AAPL", "MSFT", "AMZN", "JPM", "XOM", "JNJ"],
     "benchmark": "SPY",
-    "start_date": "2012-05-18",   # 2012-05-18: with META, 2004-08-19: without META, 1997-05-15: without GOOGL
+    "start_date": "1997-05-15",   # 2012-05-18: with META, 2004-08-19: without META, 1997-05-15: without GOOGL
     "end_date": None,     # None = today
 
     # ---- Prediction horizon ----
@@ -50,7 +50,7 @@ DEFAULT_CONFIG = {
 
     # ---- Walk-forward cross-validation ----
     "cv": {
-        "window_type": "fixed",   # "fixed" or "expanding" (fixed = sliding train window)
+        "window_type": "expanding",   # "fixed" or "expanding" (fixed = sliding train window)
         "n_folds": 5,             # set depending on dataset size
         "embargo": 10,            # trading days purged between train and test to prevent leakage
         "min_train_size": 500,    # minimum training rows before the first fold is evaluated
