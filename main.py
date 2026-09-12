@@ -2,7 +2,8 @@
 Main pipeline (repeatable): load cached data -> features -> triple-barrier
 labels -> walk-forward CV -> baseline model -> classification metrics ->
 barrier-mirrored long-only backtest -> permutation-test significance check ->
-buy-and-hold benchmark comparison -> save results + plots.
+buy-and-hold benchmark comparison -> feature diagnostics -> save results,
+models, and plots.
 
 Requires `python setup_data.py` to have been run first (this script does not
 touch the network).
@@ -14,6 +15,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import joblib
 import matplotlib.pyplot as plt
 import quantstats as qs
 from sklearn.metrics import classification_report, confusion_matrix
@@ -30,6 +32,14 @@ from backtest import (
     compute_trade_stats,
 )
 from permutation_test import run_permutation_test
+from diagnostics import (
+    compute_correlation_matrix,
+    plot_correlation_matrix,
+    highlight_momentum_cluster,
+    collect_coefficients,
+    plot_coefficient_stability,
+    coefficient_stability_summary,
+)
 
 FEATURE_COLUMNS_EXCLUDE = {
     "_log_return", "_rolling_vol_for_labeling", "label", "ticker", "date", "forward_return",
@@ -211,6 +221,8 @@ def run_pipeline(cfg: dict = None):
     cfg = cfg or DEFAULT_CONFIG
     results_dir = Path(cfg["storage"]["results_dir"])
     results_dir.mkdir(parents=True, exist_ok=True)
+    models_dir = results_dir / "models"
+    models_dir.mkdir(parents=True, exist_ok=True)
 
     print("Loading cached data and building pooled feature/label set...")
     pooled, data, benchmark_df = build_pooled_dataset(cfg)
@@ -225,6 +237,7 @@ def run_pipeline(cfg: dict = None):
 
     fold_summaries = []
     fold_windows = []
+    fold_models = []  # (fold_i, fitted_model, fitted_scaler) -- for saving + coefficient diagnostics
     all_portfolio_returns = []
     all_trades = []
     all_permutation_nulls = []
@@ -260,6 +273,12 @@ def run_pipeline(cfg: dict = None):
         model, scaler = build_model(cfg["model"])
         preds = fit_predict(model, scaler, X_train, y_train, X_test)
         preds = pd.Series(preds, index=test_df.index)
+
+        # --- Persist the fitted model (+ scaler, if any) for this fold ---
+        joblib.dump(model, models_dir / f"fold{fold_i}_model.joblib")
+        if scaler is not None:
+            joblib.dump(scaler, models_dir / f"fold{fold_i}_scaler.joblib")
+        fold_models.append((fold_i, model, scaler))
 
         # --- Classification metrics ---
         report = classification_report(
@@ -331,6 +350,32 @@ def run_pipeline(cfg: dict = None):
     results_df = pd.DataFrame(fold_summaries)
     print("\n=== Summary across folds ===")
     print(results_df)
+
+    # --- Feature diagnostics: correlation matrix + (LR-only) coefficient
+    # stability across folds. Correlation runs regardless of model type;
+    # coefficient stability only applies to logistic regression, since it's
+    # the only model here with a single linear coefficient per feature.
+    # See STATE.md Next Steps -> A. ---
+    diag_df = pooled.dropna(subset=feature_cols)
+    corr = compute_correlation_matrix(diag_df, feature_cols)
+    corr.to_csv(results_dir / "feature_correlation_matrix.csv")
+    plot_correlation_matrix(corr, results_dir)
+
+    momentum_cols = [c for c in feature_cols if c.startswith("log_return_lag")] + \
+        ["ma_ratio", "ma_crossover", "rsi", "macd_hist"]
+    momentum_corr = highlight_momentum_cluster(corr, momentum_cols)
+    momentum_corr.to_csv(results_dir / "feature_correlation_momentum_cluster.csv")
+    print("\n=== Momentum-cluster correlation (features 1-5) ===")
+    print(momentum_corr.round(2))
+
+    if cfg["model"]["type"] == "logistic_regression" and fold_models:
+        coef_df = collect_coefficients(fold_models, feature_cols)
+        coef_df.to_csv(results_dir / "coefficient_stability.csv")
+        plot_coefficient_stability(coef_df, results_dir)
+        coef_summary = coefficient_stability_summary(coef_df)
+        coef_summary.to_csv(results_dir / "coefficient_stability_summary.csv")
+        print("\n=== Coefficient stability (up-class, sorted by sign consistency) ===")
+        print(coef_summary.round(3))
 
     all_folds_beat_baseline = results_df["beats_baseline"].all() if len(results_df) else False
     combined_returns = pd.concat(all_portfolio_returns).sort_index() if all_portfolio_returns else pd.Series(dtype=float)
@@ -431,7 +476,7 @@ def run_pipeline(cfg: dict = None):
         except Exception as e:
             print(f"[warn] quantstats tearsheet generation failed: {e}")
 
-    print(f"All results saved to {results_dir}/")
+    print(f"All results saved to {results_dir}/ (fitted models in {models_dir}/)")
 
     return results_df, combined_returns
 

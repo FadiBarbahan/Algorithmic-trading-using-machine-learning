@@ -14,9 +14,9 @@ DEFAULT_CONFIG = {
     },
 
     # ---- Universe / data ----
-    "tickers": ["AAPL", "MSFT", "AMZN", "JPM", "XOM", "JNJ"],
+    "tickers": ["AAPL", "MSFT", "AMZN", "JPM", "XOM", "JNJ", "GOOGL"],
     "benchmark": "SPY",
-    "start_date": "1997-05-15",   # 2012-05-18: with META, 2004-08-19: without META, 1997-05-15: without GOOGL
+    "start_date": "2004-08-19",   # 2012-05-18: with META, 2004-08-19: without META, 1997-05-15: without GOOGL
     "end_date": None,     # None = today
 
     # ---- Prediction horizon ----
